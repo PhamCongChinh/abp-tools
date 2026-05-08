@@ -14,10 +14,12 @@ app = FastAPI(title=settings.app_name, debug=settings.debug)
 VALID_SOURCES = {"fb", "tt", "yt", "web"}
 
 
-def build_query(time_field: str, crawl_source_code: Optional[str]) -> tuple[str, list]:
+def build_queries(crawl_source_code: Optional[str]) -> tuple[str, str, list]:
     """
-    Tạo SQL query và params dựa trên time_field và crawl_source_code.
-    Trả về (sql_template, extra_params) — %s cho time_start, time_end, org_id đã có sẵn.
+    Trả về (sql_crawl, sql_pub_same_day, source_params).
+
+    - sql_crawl       : đếm tất cả bài crawl về trong ngày (theo crawl_time)
+    - sql_pub_same_day: trong số bài crawl về hôm nay, bao nhiêu bài có pub_time cũng hôm nay
     """
     source_clause = ""
     source_params = []
@@ -25,15 +27,29 @@ def build_query(time_field: str, crawl_source_code: Optional[str]) -> tuple[str,
         source_clause = "AND tp.crawl_source_code = %s"
         source_params = [crawl_source_code]
 
-    sql = f"""
+    # Query 1: tổng bài crawl về trong ngày
+    sql_crawl = f"""
         SELECT COUNT(*) as total
         FROM tbl_posts tp
-        WHERE tp.{time_field} >= %s
-        AND tp.{time_field} < %s
+        WHERE tp.crawl_time >= %s
+        AND tp.crawl_time < %s
         AND tp.org_id = %s
         {source_clause}
     """
-    return sql, source_params
+
+    # Query 2: trong số bài crawl hôm nay, bài nào có pub_time cũng hôm nay
+    sql_pub_same_day = f"""
+        SELECT COUNT(*) as total
+        FROM tbl_posts tp
+        WHERE tp.crawl_time >= %s
+        AND tp.crawl_time < %s
+        AND tp.pub_time >= %s
+        AND tp.pub_time < %s
+        AND tp.org_id = %s
+        {source_clause}
+    """
+
+    return sql_crawl, sql_pub_same_day, source_params
 
 
 @app.get("/")
@@ -92,8 +108,7 @@ def count_posts(
         results = []
         current_start = time_start
 
-        sql_pub, source_params = build_query("pub_time", crawl_source_code)
-        sql_crawl, _ = build_query("crawl_time", crawl_source_code)
+        sql_crawl, sql_pub_same_day, source_params = build_queries(crawl_source_code)
 
         while current_start < time_end:
             current_end = min(current_start + ONE_DAY, time_end)
@@ -101,26 +116,31 @@ def count_posts(
             with get_db() as conn:
                 cursor = conn.cursor()
 
-                cursor.execute(sql_pub, [current_start, current_end, org_id] + source_params)
-                result_pub = cursor.fetchone()
-
+                # Tổng bài crawl về trong ngày
                 cursor.execute(sql_crawl, [current_start, current_end, org_id] + source_params)
                 result_crawl = cursor.fetchone()
+
+                # Trong số bài crawl hôm nay, bao nhiêu bài có pub_time cũng hôm nay
+                cursor.execute(sql_pub_same_day, [current_start, current_end, current_start, current_end, org_id] + source_params)
+                result_pub = cursor.fetchone()
 
                 cursor.close()
 
             crawl_count = result_crawl['total']
-            pub_count = result_pub['total']
+            pub_same_day = result_pub['total']
 
-            ratio = ((crawl_count - pub_count) / crawl_count * 100) if crawl_count > 0 else 0
+            # Tỷ lệ sót tin = bài crawl về nhưng pub_time không đúng ngày / tổng crawl
+            # Luôn >= 0 vì pub_same_day <= crawl_count (pub_same_day là tập con của crawl)
+            missed = crawl_count - pub_same_day
+            ratio = (missed / crawl_count * 100) if crawl_count > 0 else 0
 
             results.append({
                 "time_start": current_start,
                 "time_end": current_end,
                 "date": datetime.fromtimestamp(current_start).strftime('%Y-%m-%d'),
-                "count_by_pub_time": pub_count,
                 "count_by_crawl_time": crawl_count,
-                "total_posts": crawl_count,
+                "count_pub_same_day": pub_same_day,
+                "count_missed": missed,
                 "ratio_percent": round(ratio, 2)
             })
 
@@ -167,8 +187,7 @@ def export_posts_count_to_excel(
         data = []
         current_start = time_start
 
-        sql_pub, source_params = build_query("pub_time", crawl_source_code)
-        sql_crawl, _ = build_query("crawl_time", crawl_source_code)
+        sql_crawl, sql_pub_same_day, source_params = build_queries(crawl_source_code)
 
         while current_start < time_end:
             current_end = min(current_start + ONE_DAY, time_end)
@@ -176,21 +195,21 @@ def export_posts_count_to_excel(
             with get_db() as conn:
                 cursor = conn.cursor()
 
-                cursor.execute(sql_pub, [current_start, current_end, org_id] + source_params)
-                result_pub = cursor.fetchone()
-
                 cursor.execute(sql_crawl, [current_start, current_end, org_id] + source_params)
                 result_crawl = cursor.fetchone()
+
+                cursor.execute(sql_pub_same_day, [current_start, current_end, current_start, current_end, org_id] + source_params)
+                result_pub = cursor.fetchone()
 
                 cursor.close()
 
             date_start = datetime.fromtimestamp(current_start).strftime('%Y-%m-%d %H:%M:%S')
-            date_end = datetime.fromtimestamp(current_end).strftime('%Y-%m-%d %H:%M:%S')
+            date_end   = datetime.fromtimestamp(current_end).strftime('%Y-%m-%d %H:%M:%S')
 
-            crawl_count = result_crawl['total']
-            pub_count = result_pub['total']
-
-            ratio = ((crawl_count - pub_count) / crawl_count * 100) if crawl_count > 0 else 0
+            crawl_count  = result_crawl['total']
+            pub_same_day = result_pub['total']
+            missed       = crawl_count - pub_same_day
+            ratio        = (missed / crawl_count * 100) if crawl_count > 0 else 0
 
             data.append({
                 "Ngày bắt đầu": date_start,
@@ -199,9 +218,9 @@ def export_posts_count_to_excel(
                 "Timestamp kết thúc": current_end,
                 "Org ID": org_id,
                 "Nguồn (crawl_source_code)": crawl_source_code or "all",
-                "Số lượng (pub_time)": pub_count,
-                "Số lượng (crawl_time)": crawl_count,
-                "Tổng posts": crawl_count,
+                "Tổng bài crawl về (crawl_time)": crawl_count,
+                "Bài có pub_time đúng ngày": pub_same_day,
+                "Bài sót tin (pub_time sai ngày)": missed,
                 "Tỷ lệ sót tin (%)": round(ratio, 2)
             })
 
@@ -352,10 +371,11 @@ def view_chart():
             <h1>📊 Posts Count Analytics</h1>
 
             <div class="info">
-                <strong>Giải thích:</strong><br>
-                • <strong>Tổng posts crawl được:</strong> Số bài crawl về trong ngày (crawl_time)<br>
-                • <strong>Posts có pub_time đúng ngày:</strong> Số bài có pub_time trong cùng ngày<br>
-                • <strong>Tỷ lệ sót tin:</strong> (crawl - pub) / crawl × 100%<br>
+                <strong>Giải thích cách tính:</strong><br>
+                • <strong>Tổng bài crawl về:</strong> Số bài có <code>crawl_time</code> trong ngày đó<br>
+                • <strong>Bài có pub_time đúng ngày:</strong> Trong số bài crawl về hôm nay, bao nhiêu bài có <code>pub_time</code> cũng trong ngày đó<br>
+                • <strong>Bài sót tin:</strong> Tổng crawl − Pub đúng ngày (luôn ≥ 0)<br>
+                • <strong>Tỷ lệ sót tin:</strong> Sót tin / Tổng crawl × 100%<br>
                 • <strong>Nguồn:</strong> Bỏ trống = tất cả nguồn. Chọn fb / tt / yt / web để lọc theo nguồn cụ thể.
             </div>
 
@@ -464,10 +484,11 @@ def view_chart():
             }
 
             function showStats(data) {
-                const totalPub   = data.daily_counts.reduce((s, i) => s + i.count_by_pub_time, 0);
-                const totalCrawl = data.daily_counts.reduce((s, i) => s + i.count_by_crawl_time, 0);
-                const avgRatio   = data.daily_counts.reduce((s, i) => s + i.ratio_percent, 0) / data.total_days;
-                const sourceLabel = data.crawl_source_code === 'all' ? 'Tất cả nguồn' : data.crawl_source_code.toUpperCase();
+                const totalCrawl    = data.daily_counts.reduce((s, i) => s + i.count_by_crawl_time, 0);
+                const totalPubSame  = data.daily_counts.reduce((s, i) => s + i.count_pub_same_day, 0);
+                const totalMissed   = data.daily_counts.reduce((s, i) => s + i.count_missed, 0);
+                const avgRatio      = data.daily_counts.reduce((s, i) => s + i.ratio_percent, 0) / data.total_days;
+                const sourceLabel   = data.crawl_source_code === 'all' ? 'Tất cả nguồn' : data.crawl_source_code.toUpperCase();
 
                 document.getElementById('stats').innerHTML = `
                     <div class="stat-card">
@@ -479,12 +500,16 @@ def view_chart():
                         <div class="stat-value">${data.total_days}</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">Tổng posts crawl được</div>
+                        <div class="stat-label">Tổng bài crawl về</div>
                         <div class="stat-value">${totalCrawl.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">Posts có pub_time đúng ngày</div>
-                        <div class="stat-value">${totalPub.toLocaleString()}</div>
+                        <div class="stat-label">Bài có pub_time đúng ngày</div>
+                        <div class="stat-value">${totalPubSame.toLocaleString()}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Bài sót tin</div>
+                        <div class="stat-value">${totalMissed.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-label">Tỷ lệ sót tin trung bình</div>
@@ -495,11 +520,12 @@ def view_chart():
             }
 
             function drawChart(data) {
-                const labels       = data.daily_counts.map(i => i.date);
-                const pubTimeData  = data.daily_counts.map(i => i.count_by_pub_time);
-                const crawlTimeData= data.daily_counts.map(i => i.count_by_crawl_time);
-                const ratioData    = data.daily_counts.map(i => i.ratio_percent);
-                const sourceLabel  = data.crawl_source_code === 'all' ? 'Tất cả nguồn' : data.crawl_source_code.toUpperCase();
+                const labels        = data.daily_counts.map(i => i.date);
+                const crawlData     = data.daily_counts.map(i => i.count_by_crawl_time);
+                const pubSameData   = data.daily_counts.map(i => i.count_pub_same_day);
+                const missedData    = data.daily_counts.map(i => i.count_missed);
+                const ratioData     = data.daily_counts.map(i => i.ratio_percent);
+                const sourceLabel   = data.crawl_source_code === 'all' ? 'Tất cả nguồn' : data.crawl_source_code.toUpperCase();
 
                 // --- Line Chart ---
                 if (lineChartInstance) lineChartInstance.destroy();
@@ -510,18 +536,26 @@ def view_chart():
                         labels,
                         datasets: [
                             {
-                                label: 'Tổng posts crawl được',
-                                data: crawlTimeData,
+                                label: 'Tổng bài crawl về',
+                                data: crawlData,
                                 borderColor: 'rgb(40, 167, 69)',
                                 backgroundColor: 'rgba(40, 167, 69, 0.1)',
                                 borderWidth: 3, tension: 0.4, fill: true
                             },
                             {
-                                label: 'Posts có pub_time đúng ngày',
-                                data: pubTimeData,
+                                label: 'Bài có pub_time đúng ngày',
+                                data: pubSameData,
                                 borderColor: 'rgb(102, 126, 234)',
                                 backgroundColor: 'rgba(102, 126, 234, 0.1)',
                                 borderWidth: 3, tension: 0.4, fill: true
+                            },
+                            {
+                                label: 'Bài sót tin (pub_time sai ngày)',
+                                data: missedData,
+                                borderColor: 'rgb(255, 99, 132)',
+                                backgroundColor: 'rgba(255, 99, 132, 0.1)',
+                                borderWidth: 2, tension: 0.4, fill: true,
+                                borderDash: [5, 5]
                             }
                         ]
                     },
@@ -544,7 +578,7 @@ def view_chart():
                         scales: {
                             y: {
                                 beginAtZero: true,
-                                title: { display: true, text: 'Số lượng posts', font: { size: 13, weight: 'bold' } }
+                                title: { display: true, text: 'Số lượng bài', font: { size: 13, weight: 'bold' } }
                             }
                         }
                     }
@@ -586,9 +620,9 @@ def view_chart():
                                         const i = ctx.dataIndex;
                                         return [
                                             '',
-                                            'Crawl: ' + crawlTimeData[i].toLocaleString(),
-                                            'Pub đúng ngày: ' + pubTimeData[i].toLocaleString(),
-                                            'Sót tin: ' + (crawlTimeData[i] - pubTimeData[i]).toLocaleString()
+                                            'Tổng crawl: '           + crawlData[i].toLocaleString(),
+                                            'Pub đúng ngày: '        + pubSameData[i].toLocaleString(),
+                                            'Sót tin: '              + missedData[i].toLocaleString()
                                         ];
                                     }
                                 }
@@ -596,13 +630,12 @@ def view_chart():
                         },
                         scales: {
                             y: {
-                                beginAtZero: true, max: 100,
+                                beginAtZero: true,
                                 title: { display: true, text: 'Tỷ lệ (%)', font: { size: 13, weight: 'bold' } },
                                 ticks: { callback: v => v + '%' },
                                 grid: {
-                                    color: ctx => (ctx.tick.value === 10 || ctx.tick.value === 25)
-                                        ? 'rgba(255, 99, 132, 0.3)' : 'rgba(0,0,0,0.1)',
-                                    lineWidth: ctx => (ctx.tick.value === 10 || ctx.tick.value === 25) ? 2 : 1
+                                    color: 'rgba(0,0,0,0.1)',
+                                    lineWidth: 1
                                 }
                             }
                         }
