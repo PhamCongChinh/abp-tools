@@ -1,0 +1,14 @@
+@echo off
+echo Creating virtual environment...
+python -m venv .env
+
+echo Activating virtual environment...
+call .env\Scripts\activate.bat
+
+echo Installing dependencies...
+pip install -r requirements.txt
+
+echo.
+echo Setup complete!
+echo Run "run.bat" to start the application.
+pause
