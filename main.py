@@ -16,10 +16,8 @@ VALID_SOURCES = {"fb", "tt", "yt", "web"}
 
 def build_queries(crawl_source_code: Optional[str]) -> tuple[str, str, list]:
     """
-    Trả về (sql_crawl, sql_pub_same_day, source_params).
-
-    - sql_crawl       : đếm tất cả bài crawl về trong ngày (theo crawl_time)
-    - sql_pub_same_day: trong số bài crawl về hôm nay, bao nhiêu bài có pub_time cũng hôm nay
+    - sql_crawl       : tổng bài crawl về trong ngày (theo crawl_time)
+    - sql_missed      : bài crawl về hôm nay nhưng pub_time < crawl_time - 12h (sót tin)
     """
     source_clause = ""
     source_params = []
@@ -37,19 +35,19 @@ def build_queries(crawl_source_code: Optional[str]) -> tuple[str, str, list]:
         {source_clause}
     """
 
-    # Query 2: trong số bài crawl hôm nay, bài nào có pub_time cũng hôm nay
-    sql_pub_same_day = f"""
+    # Query 2: bài crawl về hôm nay nhưng pub_time < crawl_time - 12 giờ (43200 giây)
+    # → bài đã đăng hơn 12 tiếng trước mới crawl được = sót tin
+    sql_missed = f"""
         SELECT COUNT(*) as total
         FROM tbl_posts tp
         WHERE tp.crawl_time >= %s
         AND tp.crawl_time < %s
-        AND tp.pub_time >= %s
-        AND tp.pub_time < %s
+        AND tp.pub_time < (tp.crawl_time - 43200)
         AND tp.org_id = %s
         {source_clause}
     """
 
-    return sql_crawl, sql_pub_same_day, source_params
+    return sql_crawl, sql_missed, source_params
 
 
 @app.get("/")
@@ -108,7 +106,7 @@ def count_posts(
         results = []
         current_start = time_start
 
-        sql_crawl, sql_pub_same_day, source_params = build_queries(crawl_source_code)
+        sql_crawl, sql_missed, source_params = build_queries(crawl_source_code)
 
         while current_start < time_end:
             current_end = min(current_start + ONE_DAY, time_end)
@@ -120,27 +118,25 @@ def count_posts(
                 cursor.execute(sql_crawl, [current_start, current_end, org_id] + source_params)
                 result_crawl = cursor.fetchone()
 
-                # Trong số bài crawl hôm nay, bao nhiêu bài có pub_time cũng hôm nay
-                cursor.execute(sql_pub_same_day, [current_start, current_end, current_start, current_end, org_id] + source_params)
-                result_pub = cursor.fetchone()
+                # Bài sót tin: crawl hôm nay nhưng pub_time < crawl_time - 12h
+                cursor.execute(sql_missed, [current_start, current_end, org_id] + source_params)
+                result_missed = cursor.fetchone()
 
                 cursor.close()
 
-            crawl_count = result_crawl['total']
-            pub_same_day = result_pub['total']
+            crawl_count  = result_crawl['total']
+            missed_count = result_missed['total']
+            on_time      = crawl_count - missed_count
 
-            # Tỷ lệ sót tin = bài crawl về nhưng pub_time không đúng ngày / tổng crawl
-            # Luôn >= 0 vì pub_same_day <= crawl_count (pub_same_day là tập con của crawl)
-            missed = crawl_count - pub_same_day
-            ratio = (missed / crawl_count * 100) if crawl_count > 0 else 0
+            ratio = (missed_count / crawl_count * 100) if crawl_count > 0 else 0
 
             results.append({
                 "time_start": current_start,
                 "time_end": current_end,
                 "date": datetime.fromtimestamp(current_start).strftime('%Y-%m-%d'),
                 "count_by_crawl_time": crawl_count,
-                "count_pub_same_day": pub_same_day,
-                "count_missed": missed,
+                "count_pub_same_day": on_time,
+                "count_missed": missed_count,
                 "ratio_percent": round(ratio, 2)
             })
 
@@ -187,7 +183,7 @@ def export_posts_count_to_excel(
         data = []
         current_start = time_start
 
-        sql_crawl, sql_pub_same_day, source_params = build_queries(crawl_source_code)
+        sql_crawl, sql_missed, source_params = build_queries(crawl_source_code)
 
         while current_start < time_end:
             current_end = min(current_start + ONE_DAY, time_end)
@@ -198,18 +194,18 @@ def export_posts_count_to_excel(
                 cursor.execute(sql_crawl, [current_start, current_end, org_id] + source_params)
                 result_crawl = cursor.fetchone()
 
-                cursor.execute(sql_pub_same_day, [current_start, current_end, current_start, current_end, org_id] + source_params)
-                result_pub = cursor.fetchone()
+                cursor.execute(sql_missed, [current_start, current_end, org_id] + source_params)
+                result_missed = cursor.fetchone()
 
                 cursor.close()
 
-            date_start = datetime.fromtimestamp(current_start).strftime('%Y-%m-%d %H:%M:%S')
-            date_end   = datetime.fromtimestamp(current_end).strftime('%Y-%m-%d %H:%M:%S')
+            date_start   = datetime.fromtimestamp(current_start).strftime('%Y-%m-%d %H:%M:%S')
+            date_end     = datetime.fromtimestamp(current_end).strftime('%Y-%m-%d %H:%M:%S')
 
             crawl_count  = result_crawl['total']
-            pub_same_day = result_pub['total']
-            missed       = crawl_count - pub_same_day
-            ratio        = (missed / crawl_count * 100) if crawl_count > 0 else 0
+            missed_count = result_missed['total']
+            on_time      = crawl_count - missed_count
+            ratio        = (missed_count / crawl_count * 100) if crawl_count > 0 else 0
 
             data.append({
                 "Ngày bắt đầu": date_start,
@@ -219,8 +215,8 @@ def export_posts_count_to_excel(
                 "Org ID": org_id,
                 "Nguồn (crawl_source_code)": crawl_source_code or "all",
                 "Tổng bài crawl về (crawl_time)": crawl_count,
-                "Bài có pub_time đúng ngày": pub_same_day,
-                "Bài sót tin (pub_time sai ngày)": missed,
+                "Bài crawl đúng hạn (pub < 12h)": on_time,
+                "Bài sót tin (pub_time > crawl_time - 12h)": missed_count,
                 "Tỷ lệ sót tin (%)": round(ratio, 2)
             })
 
@@ -373,8 +369,8 @@ def view_chart():
             <div class="info">
                 <strong>Giải thích cách tính:</strong><br>
                 • <strong>Tổng bài crawl về:</strong> Số bài có <code>crawl_time</code> trong ngày đó<br>
-                • <strong>Bài có pub_time đúng ngày:</strong> Trong số bài crawl về hôm nay, bao nhiêu bài có <code>pub_time</code> cũng trong ngày đó<br>
-                • <strong>Bài sót tin:</strong> Tổng crawl − Pub đúng ngày (luôn ≥ 0)<br>
+                • <strong>Bài crawl đúng hạn:</strong> Bài crawl về hôm nay mà <code>pub_time ≥ crawl_time - 12h</code> (bài mới, không sót)<br>
+                • <strong>Bài sót tin:</strong> Bài crawl về hôm nay nhưng <code>pub_time &lt; crawl_time - 12h</code> (bài đã đăng hơn 12 tiếng mới crawl được)<br>
                 • <strong>Tỷ lệ sót tin:</strong> Sót tin / Tổng crawl × 100%<br>
                 • <strong>Nguồn:</strong> Bỏ trống = tất cả nguồn. Chọn fb / tt / yt / web để lọc theo nguồn cụ thể.
             </div>
@@ -504,11 +500,11 @@ def view_chart():
                         <div class="stat-value">${totalCrawl.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">Bài có pub_time đúng ngày</div>
+                        <div class="stat-label">Bài crawl đúng hạn</div>
                         <div class="stat-value">${totalPubSame.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">Bài sót tin</div>
+                        <div class="stat-label">Bài sót tin (pub > 12h)</div>
                         <div class="stat-value">${totalMissed.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
@@ -543,14 +539,14 @@ def view_chart():
                                 borderWidth: 3, tension: 0.4, fill: true
                             },
                             {
-                                label: 'Bài có pub_time đúng ngày',
+                                label: 'Bài crawl đúng hạn (pub < 12h)',
                                 data: pubSameData,
                                 borderColor: 'rgb(102, 126, 234)',
                                 backgroundColor: 'rgba(102, 126, 234, 0.1)',
                                 borderWidth: 3, tension: 0.4, fill: true
                             },
                             {
-                                label: 'Bài sót tin (pub_time sai ngày)',
+                                label: 'Bài sót tin (pub > 12h)',
                                 data: missedData,
                                 borderColor: 'rgb(255, 99, 132)',
                                 backgroundColor: 'rgba(255, 99, 132, 0.1)',
