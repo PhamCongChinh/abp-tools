@@ -17,7 +17,7 @@ VALID_SOURCES = {"fb", "tt", "yt", "web"}
 def build_queries(crawl_source_code: Optional[str]) -> tuple[str, str, list]:
     """
     - sql_crawl       : tổng bài crawl về trong ngày (theo crawl_time)
-    - sql_missed      : bài crawl về hôm nay nhưng pub_time < crawl_time - 12h (sót tin)
+    - sql_missed      : bài crawl về hôm nay nhưng pub_time < crawl_time - 2h (độ trễ)
     """
     source_clause = ""
     source_params = []
@@ -35,18 +35,18 @@ def build_queries(crawl_source_code: Optional[str]) -> tuple[str, str, list]:
         {source_clause}
     """
 
-    # Query 2: bài crawl về hôm nay nhưng pub_time < crawl_time - 12 giờ (43200 giây)
-    # → bài đã đăng hơn 12 tiếng trước mới crawl được = sót tin
+    # Query 2: bài crawl về hôm nay nhưng pub_time < crawl_time - 2 giờ (7200 giây)
+    # → bài đã đăng hơn 2 tiếng trước mới crawl được = có độ trễ
     sql_missed = f"""
         SELECT COUNT(*) as total
         FROM tbl_posts tp
         WHERE tp.crawl_time >= %s
         AND tp.crawl_time < %s
-        AND tp.pub_time < (tp.crawl_time - 43200)
+        AND tp.pub_time < (tp.crawl_time - 7200)
         AND tp.org_id = %s
         {source_clause}
     """
-
+    # 21600
     return sql_crawl, sql_missed, source_params
 
 
@@ -118,7 +118,7 @@ def count_posts(
                 cursor.execute(sql_crawl, [current_start, current_end, org_id] + source_params)
                 result_crawl = cursor.fetchone()
 
-                # Bài sót tin: crawl hôm nay nhưng pub_time < crawl_time - 12h
+                # Bài có độ trễ: crawl hôm nay nhưng pub_time < crawl_time - 2h
                 cursor.execute(sql_missed, [current_start, current_end, org_id] + source_params)
                 result_missed = cursor.fetchone()
 
@@ -215,9 +215,9 @@ def export_posts_count_to_excel(
                 "Org ID": org_id,
                 "Nguồn (crawl_source_code)": crawl_source_code or "all",
                 "Tổng bài crawl về (crawl_time)": crawl_count,
-                "Bài crawl đúng hạn (pub < 12h)": on_time,
-                "Bài sót tin (pub_time > crawl_time - 12h)": missed_count,
-                "Tỷ lệ sót tin (%)": round(ratio, 2)
+                "Bài crawl đúng hạn (pub < 2h)": on_time,
+                "Bài có độ trễ (pub_time > crawl_time - 2h)": missed_count,
+                "Tỷ lệ độ trễ (%)": round(ratio, 2)
             })
 
             current_start = current_end
@@ -369,9 +369,9 @@ def view_chart():
             <div class="info">
                 <strong>Giải thích cách tính:</strong><br>
                 • <strong>Tổng bài crawl về:</strong> Số bài có <code>crawl_time</code> trong ngày đó<br>
-                • <strong>Bài crawl đúng hạn:</strong> Bài crawl về hôm nay mà <code>pub_time ≥ crawl_time - 12h</code> (bài mới, không sót)<br>
-                • <strong>Bài sót tin:</strong> Bài crawl về hôm nay nhưng <code>pub_time &lt; crawl_time - 12h</code> (bài đã đăng hơn 12 tiếng mới crawl được)<br>
-                • <strong>Tỷ lệ sót tin:</strong> Sót tin / Tổng crawl × 100%<br>
+                • <strong>Bài crawl đúng hạn:</strong> Bài crawl về hôm nay mà <code>pub_time ≥ crawl_time - 2h</code> (không có độ trễ)<br>
+                • <strong>Bài có độ trễ:</strong> Bài crawl về hôm nay nhưng <code>pub_time &lt; crawl_time - 2h</code> (bài đã đăng hơn 2 tiếng mới crawl được)<br>
+                • <strong>Tỷ lệ độ trễ:</strong> Độ trễ / Tổng crawl × 100%<br>
                 • <strong>Nguồn:</strong> Bỏ trống = tất cả nguồn. Chọn fb / tt / yt / web để lọc theo nguồn cụ thể.
             </div>
 
@@ -504,11 +504,11 @@ def view_chart():
                         <div class="stat-value">${totalPubSame.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">Bài sót tin (pub > 12h)</div>
+                        <div class="stat-label">Bài có độ trễ (pub > 2h)</div>
                         <div class="stat-value">${totalMissed.toLocaleString()}</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">Tỷ lệ sót tin trung bình</div>
+                        <div class="stat-label">Tỷ lệ độ trễ trung bình</div>
                         <div class="stat-value">${avgRatio.toFixed(2)}%</div>
                     </div>
                 `;
@@ -539,14 +539,14 @@ def view_chart():
                                 borderWidth: 3, tension: 0.4, fill: true
                             },
                             {
-                                label: 'Bài crawl đúng hạn (pub < 12h)',
+                                label: 'Bài crawl đúng hạn (pub < 2h)',
                                 data: pubSameData,
                                 borderColor: 'rgb(102, 126, 234)',
                                 backgroundColor: 'rgba(102, 126, 234, 0.1)',
                                 borderWidth: 3, tension: 0.4, fill: true
                             },
                             {
-                                label: 'Bài sót tin (pub > 12h)',
+                                label: 'Bài có độ trễ (pub > 2h)',
                                 data: missedData,
                                 borderColor: 'rgb(255, 99, 132)',
                                 backgroundColor: 'rgba(255, 99, 132, 0.1)',
@@ -593,7 +593,7 @@ def view_chart():
                     data: {
                         labels,
                         datasets: [{
-                            label: 'Tỷ lệ sót tin (%)',
+                            label: 'Tỷ lệ độ trễ (%)',
                             data: ratioData,
                             backgroundColor: barColors,
                             borderColor: barColors.map(c => c.replace('0.8', '1')),
@@ -606,19 +606,19 @@ def view_chart():
                             legend: { display: false },
                             title: {
                                 display: true,
-                                text: `Tỷ lệ sót tin (%) | Nguồn: ${sourceLabel}`,
+                                text: `Tỷ lệ độ trễ (%) | Nguồn: ${sourceLabel}`,
                                 font: { size: 15, weight: 'bold' }, padding: 15
                             },
                             tooltip: {
                                 callbacks: {
-                                    label: ctx => 'Tỷ lệ sót tin: ' + ctx.parsed.y.toFixed(2) + '%',
+                                    label: ctx => 'Tỷ lệ độ trễ: ' + ctx.parsed.y.toFixed(2) + '%',
                                     afterLabel: ctx => {
                                         const i = ctx.dataIndex;
                                         return [
                                             '',
-                                            'Tổng crawl: '           + crawlData[i].toLocaleString(),
-                                            'Pub đúng ngày: '        + pubSameData[i].toLocaleString(),
-                                            'Sót tin: '              + missedData[i].toLocaleString()
+                                            'Tổng crawl: '      + crawlData[i].toLocaleString(),
+                                            'Đúng hạn: '        + pubSameData[i].toLocaleString(),
+                                            'Có độ trễ: '       + missedData[i].toLocaleString()
                                         ];
                                     }
                                 }
@@ -627,7 +627,7 @@ def view_chart():
                         scales: {
                             y: {
                                 beginAtZero: true,
-                                title: { display: true, text: 'Tỷ lệ (%)', font: { size: 13, weight: 'bold' } },
+                        title: { display: true, text: 'Tỷ lệ (%)', font: { size: 13, weight: 'bold' } },
                                 ticks: { callback: v => v + '%' },
                                 grid: {
                                     color: 'rgba(0,0,0,0.1)',
